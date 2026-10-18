@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name          抖音下载（网页版）·队列可续跑补丁
 // @namespace     https://github.com/xiaohuitongxue88-ctrl/douyin-downloader
-// @version       2.1.2-patch1
-// @description   基于 2.1.2 的本地补丁：等待中的任务可单个或整批开始，刷新后队列停摆会弹确认框提示继续。
+// @version       2.1.2-patch2
+// @description   基于 2.1.2 的本地补丁：等待中的任务可单个或整批开始，队列停摆弹窗可一键开始或取消全部；作者作品支持按视频/图集分开批量勾选，并可清除已下载/已提交标记；任务页可批量取消需处理项；修复取消后刷新又变回等待中（不再回收过期会话快照并定期清理残留）；修复图集按文件夹/逐张保存时只存第一张、文件名未带作品名。
 // @author        小辉同學
 // @match         https://*.douyin.com/*
 // @icon          data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAzMiAzMiI+PHJlY3Qgd2lkdGg9IjMyIiBoZWlnaHQ9IjMyIiByeD0iOSIgZmlsbD0iI2YwZmFmNSIvPjxwYXRoIGQ9Ik0xMyA1TDE2IDEyTDIzIDE1TDE2IDE4TDEzIDI1TDEwIDE4TDMgMTVMMTAgMTJaIiBmaWxsPSIjMmY5ZWFhIi8+PHBhdGggZD0iTTI2IDN2OE0yMiA3aDgiIHN0cm9rZT0iI2M0OTYzNiIgc3Ryb2tlLXdpZHRoPSIyIi8+PC9zdmc+
@@ -2176,7 +2176,12 @@ button:hover .dy-copy .front-copy,button:focus-visible .dy-copy .front-copy{anim
             const value = String(id || '').trim();
             const unique = /^\d+$/.test(value) ? BigInt(value).toString(36) : normalizeFilename(value || 'media');
             const suffix = '_' + unique;
-            let title = normalizeFilename(String(base || '无标题作品')).replace(/\./g, '_');
+            // 命名模板清空后 base 就是空串：只留编号。判断必须早于 normalizeFilename，
+            // 因为它对空串会返回兜底的 "file"。
+            const rawBase = String(base ?? '').trim();
+            if (!rawBase)
+                return unique;
+            let title = normalizeFilename(rawBase).replace(/\./g, '_');
             if (title.endsWith(suffix))
                 title = title.slice(0, -suffix.length);
             const limit = Math.max(suffix.length + 1, Math.min(180, Number(maxLength) || 120));
@@ -2662,12 +2667,14 @@ button:hover .dy-copy .front-copy,button:focus-visible .dy-copy .front-copy{anim
             const total = Math.max(Number(stats.total) || 0, live + (Number(stats.completed) || 0) + (Number(stats.submitted) || 0) + (Number(stats.cancelled) || 0));
             const buckets = [active, queued, paused, needsAttention].filter(value => value > 0).length;
             const empty = live === 0;
+            const attention = (Number(stats.failed) || 0) + (Number(stats.unavailable) || 0);
             return {
                 empty,
                 showMetrics: !empty && (live >= 3 || buckets >= 2),
                 showSearch: !empty && total >= 6,
                 showFilter: !empty && (total >= 6 || buckets >= 2),
-                showRetryFailed: (Number(stats.failed) || 0) + (Number(stats.unavailable) || 0) > 0,
+                showRetryFailed: attention > 0,
+                showCancelAttention: needsAttention > 0,
                 showClearDone: (Number(stats.completed) || 0) + (Number(stats.submitted) || 0) + (Number(stats.cancelled) || 0) > 0,
                 overviewText: live ? (active + queued + paused > 0 ? `还剩 ${live} 项` : `${needsAttention} 项需处理`) : '',
                 needsAttention,
@@ -2798,6 +2805,18 @@ button:hover .dy-copy .front-copy,button:focus-visible .dy-copy .front-copy{anim
                     : videos > 0 && albums > 0 ? `已载入类型：${videos} 个视频 · ${albums} 个图集` : "",
             };
         },
+    });
+
+    // 作品类型的唯一判定口径：列表标签与按类型批量选中必须共用，否则按钮数量与逐行显示会对不上。
+    const ProfileWorkType = Object.freeze({
+        of(media, snap, indexed) {
+            if (Array.isArray(media?.images) && media.images.length) return "album";
+            if (snap?.type === "album") return "album";
+            if (media?.video) return "video";
+            if (snap?.type === "video") return "video";
+            return indexed === "album" || indexed === "video" ? indexed : "unknown";
+        },
+        label(type) { return type === "album" ? "图集" : type === "video" ? "视频" : "待读取"; },
     });
 
     const SettingsPagePolicy = Object.freeze({
@@ -3983,6 +4002,7 @@ button:hover .dy-copy .front-copy,button:focus-visible .dy-copy .front-copy{anim
      */
     class TaskPersistence {
         static STORAGE_PREFIX = "__douyin-dl-unified-task-session-v210__:";
+        static STALE_SESSION_GRACE_MS = 7200000;
         static LEGACY_STORAGE_KEY = "__douyin-dl-unified-tasks-v210__";
         static RISK_COPY = "下载进行期间请保持此标签页打开。刷新或关闭标签页会中断页面内任务；任务记录会保留，重新打开后可继续或重试。";
         constructor(store, scheduler, getExecutorKind = () => "browser", tabCoordinator = null) {
@@ -3994,6 +4014,7 @@ button:hover .dy-copy .front-copy,button:focus-visible .dy-copy .front-copy{anim
             this.storageKey = TaskPersistence.STORAGE_PREFIX + this.tabId;
             this.saveTimer = 0;
             this.bound = false;
+            this.sessionSavedAt = 0;
             this.hidden = Boolean(document.hidden);
             this.offTaskChange = null;
         }
@@ -4022,6 +4043,25 @@ button:hover .dy-copy .front-copy,button:focus-visible .dy-copy .front-copy{anim
             } catch {}
             return sessions;
         }
+        // 历史标签页的会话快照只在“被别的标签页回收”时才会删除；残留越多，越容易在取消等待项后被重新导入。
+        // 这里清掉“已被本标签页落盘覆盖、且超过宽限期”的键，宽限期留给仍然开着但没写过盘的标签页。
+        pruneStaleSessions() {
+            const now = Date.now();
+            const lease = this.tabCoordinator?.readLease?.() || null;
+            const liveOwner = TabOwnershipPolicy.isLeaseAlive(lease, now) ? String(lease?.tabId || "") : "";
+            let removed = 0;
+            for (let i = localStorage.length - 1; i >= 0; i--) {
+                const key = localStorage.key(i);
+                if (!key?.startsWith(TaskPersistence.STORAGE_PREFIX)) continue;
+                const tabId = key.slice(TaskPersistence.STORAGE_PREFIX.length);
+                if (!tabId || tabId === this.tabId || tabId === liveOwner) continue;
+                const savedAt = Number(this._readSession(key)?.savedAt || 0);
+                if (now - savedAt < TaskPersistence.STALE_SESSION_GRACE_MS) continue;
+                if (this.sessionSavedAt && savedAt > this.sessionSavedAt) continue;
+                try { localStorage.removeItem(key); removed++; } catch {}
+            }
+            return removed;
+        }
         saveSession(reason = "update") {
             clearTimeout(this.saveTimer);
             this.saveTimer = 0;
@@ -4035,6 +4075,7 @@ button:hover .dy-copy .front-copy,button:focus-visible .dy-copy .front-copy{anim
             session.ownerTabId = this.tabId;
             try {
                 localStorage.setItem(this.storageKey, JSON.stringify(session));
+                this.sessionSavedAt = Number(session.savedAt) || this.sessionSavedAt;
                 return session;
             } catch (error) {
                 console.warn("[dy-dl]任务状态保存失败", error);
@@ -4077,6 +4118,7 @@ button:hover .dy-copy .front-copy,button:focus-visible .dy-copy .front-copy{anim
                 return null;
             }
             const session = picked.session;
+            this.sessionSavedAt = Math.max(this.sessionSavedAt, Number(session.savedAt) || 0);
             this.store.restoreInto(session.tasks);
             const decision = TabOwnershipPolicy.restoreDecision({
                 currentTabId: this.tabId,
@@ -4106,6 +4148,11 @@ button:hover .dy-copy .front-copy,button:focus-visible .dy-copy .front-copy{anim
             if (localUnresolved > 0) return false;
             const sessions = this._allSessions();
             delete sessions[this.tabId];
+            // 比本标签页最近一次落盘更旧的会话快照代表已被覆盖的历史状态；
+            // 若不拦下，取消掉等待项后正是 localUnresolved 归零，旧快照会把同一批作品重新变成等待中。
+            for (const tabId of Object.keys(sessions)) {
+                if (Number(sessions[tabId]?.savedAt || 0) <= this.sessionSavedAt) delete sessions[tabId];
+            }
             const lease = this.tabCoordinator?.readLease?.() || null;
             const picked = TabOwnershipPolicy.pickSession({ currentTabId: this.tabId, sessions, lease, now: Date.now() });
             if (!picked.session || picked.foreignAlive || !picked.recoveredFromTabId) return false;
@@ -4402,7 +4449,9 @@ button:hover .dy-copy .front-copy,button:focus-visible .dy-copy .front-copy{anim
                                 data = await stored.fileHandle.getFile();
                             }
                         }
-                        const name = `${String(index + 1).padStart(Math.max(3, String(media.images.length).length), '0')}.${info.ext}`;
+                        const entrySeq = String(index + 1).padStart(Math.max(3, String(media.images.length).length), '0');
+                        const entryStem = state.base ? normalizeFilename(String(state.base), { maxLength: 200 }) : '图集';
+                        const name = `${entryStem}_${entrySeq}.${info.ext}`;
                         const item = { index, name, kind, phase: 'completed', size: data.size, fileHandle: stored.fileHandle || null };
                         if (!stored.fileHandle) {
                             if (this.memoryBytes + data.size > this.MEMORY_LIMIT)
@@ -4492,7 +4541,10 @@ button:hover .dy-copy .front-copy,button:focus-visible .dy-copy .front-copy{anim
             const activate = () => { DownloadRuntime.setCancel(cancel); options.onCancelReady?.(cancel); };
             const emit = partial => {
                 const finished = [...state.items.values()].filter(x => ['completed', 'submitted'].includes(x.phase)).length;
-                options.onProgress?.({ ...partial, method: mode === 'zip' ? 'zip' : external ? features.using_downloader : 'file_system',
+                // 非 zip 模式每个子项都会透传自己的 completed/submitted；整个图集只有一个任务状态机，
+                // 终态只能由 finish() 给出，否则第 2 项起就是 illegal transition，失败原因也被吞掉。
+                const phase = partial.phase === 'completed' || partial.phase === 'submitted' ? 'downloading' : partial.phase;
+                options.onProgress?.({ ...partial, phase, method: mode === 'zip' ? 'zip' : external ? features.using_downloader : 'file_system',
                     filename: mode === 'zip' ? base + '.zip' : base, children: this.children(state), completedCount: finished, childTotal: state.total,
                     status: partial.status || `图集 ${finished}/${state.total}`, percent: mode === 'zip' ? finished / state.total * 95 : finished / state.total * 100 });
             };
@@ -4559,9 +4611,10 @@ button:hover .dy-copy .front-copy,button:focus-visible .dy-copy .front-copy{anim
                         const kind = item.video ? 'video' : 'image';
                         const urls = item.video ? handler._get_video_urls(item.video) : MediaAssets.images(item);
                         const previous = state.items.get(index);
-                        const filename = mode === 'folder' ? String(index + 1).padStart(Math.max(3, String(state.total).length), '0') : `${base}_${String(index + 1).padStart(3, '0')}`;
+                        const seq = String(index + 1).padStart(Math.max(3, String(state.total).length), '0');
+                        const filename = `${base ? normalizeFilename(String(base), { maxLength: 200 }) : '图集'}_${seq}`;
                         const childOptions = { ...(previous?.context || {}), media, fileKind: kind, resourceKey: state.mediaId + '|' + kind + '|' + index,
-                            browserContext: state.directory ? { kind: 'directory', directoryHandle: state.directory, batch: true } : options.browserContext,
+                            browserContext: state.directory ? { kind: 'directory', directoryHandle: state.directory, batch: true, writeReady: true } : options.browserContext,
                             albumDirectory: mode === 'folder' ? base : '', batch: true, silent: true, showGlobalProgress: false,
                             onProgress: p => emit({ ...p, status: `${index + 1}/${state.total} · ${p.status || '正在下载'}` }),
                             refreshSources: async request => {
@@ -9286,7 +9339,7 @@ ${MotionIcons.css}</style><div class="dock"><div class="ambient-shell" id="ambie
                 return bigintStr;
             }
         }
-        _build_filename(media = this.current_media, template = Config.global.features.filename_template || Config.defaults.filename_template, maxLength = Config.global.features.filename_max_length, throwError = false) {
+        _build_filename(media = this.current_media, template = typeof Config.global.features.filename_template === 'string' ? Config.global.features.filename_template : Config.defaults.filename_template, maxLength = Config.global.features.filename_max_length, throwError = false) {
             if (!media)
                 return '无标题作品';
             const awemeId = MediaAssets.id(media), title = MediaAssets.title(media);
@@ -9298,7 +9351,12 @@ ${MotionIcons.css}</style><div class="dock"><div class="ambient-shell" id="ambie
                 create_date_YYYYMMDD: formatDate(created, 'YYYYMMDD'), create_date_YYYYMMDD_HHmmss: formatDate(created, 'YYYYMMDD_HHmmss') };
             let base;
             try {
-                base = (!throwError && this.customNames?.get(awemeId)) || renderTemplate(context, template) || title;
+                // 模板清空是明确意图：不退回标题，只用编号命名。
+                const blankTemplate = !String(template ?? '').trim();
+                if (blankTemplate)
+                    base = (!throwError && this.customNames?.get(awemeId)) || '';
+                else
+                    base = (!throwError && this.customNames?.get(awemeId)) || renderTemplate(context, template) || title;
             }
             catch (error) {
                 if (throwError)
@@ -10556,6 +10614,52 @@ ${MotionIcons.css}</style><div class="dock"><div class="ambient-shell" id="ambie
             this.emit("stateChanged");
             this.emit("countsUpdated", this.getCounts());
             this._publishTaskCenter();
+        }
+        mediaTypeOf(awemeId) {
+            const id = String(awemeId || "");
+            return ProfileWorkType.of(this.dataService.feedMediaCache.get(id), this.getTaskSnapshot(id), this.dataService.profileIndex.items.get(id)?.type);
+        }
+        getTypeCounts() {
+            const counts = { video: 0, album: 0, unknown: 0 };
+            for (const id of this.jobState?.knownIds || []) counts[this.mediaTypeOf(id)]++;
+            return counts;
+        }
+        markSelectByType(type) {
+            const ids = (this.jobState?.knownIds || []).filter((id) => this.mediaTypeOf(id) === type);
+            if (!ids.length) return 0;
+            for (const id of ids) {
+                this.selectedIds.add(id);
+                const media = this.dataService.feedMediaCache.get(id);
+                if (media && !this.taskSnapshots.has(id)) this._rememberTaskSnapshot(media);
+            }
+            this._rebuildSelectionSummary();
+            for (const id of this.dataService.profileIndex.ids()) this.dataService.profileIndex.select(id, this.selectedIds.has(id));
+            if (!this.jobRunning && !this.pausedRun && this.jobState?.status === "completed") {
+                this.jobState.status = "idle";
+                this.currentRun = null;
+                this._saveJobState();
+            }
+            this.emit("selectionChanged", { all: true, selected: true, summary: this.getSelectionSummary() });
+            this.emit("stateChanged");
+            this.emit("countsUpdated", this.getCounts());
+            this._publishTaskCenter();
+            return ids.length;
+        }
+        getCompletionRecordCounts() {
+            return { downloaded: (this.jobState?.downloadedIds || []).length, submitted: Object.keys(this.jobState?.submittedItems || {}).length };
+        }
+        resetCompletionRecords() {
+            const { downloaded, submitted } = this.getCompletionRecordCounts();
+            if (!downloaded && !submitted) return { downloaded: 0, submitted: 0 };
+            this.jobState.downloadedIds = [];
+            this.jobState.submittedItems = {};
+            this._saveJobState();
+            this._rebuildSelectionSummary();
+            this.emit("selectionChanged", { all: true, selected: true, summary: this.getSelectionSummary() });
+            this.emit("stateChanged");
+            this.emit("countsUpdated", this.getCounts());
+            this._publishTaskCenter();
+            return { downloaded, submitted };
         }
         isSelectAll() {
             return (this.selectedIds.size > 0 &&
@@ -13576,6 +13680,11 @@ h1{font-size:24px;letter-spacing:-.02em;font-weight:650}
 <button class="secondary" id="profileSelectAll" type="button">全选已载入</button>
 <button class="secondary" id="profileDeselect" type="button">取消全选</button>
 </div>
+<div class="profile-buttons">
+<button class="secondary" id="profileSelectVideos" type="button">全选视频</button>
+<button class="secondary" id="profileSelectAlbums" type="button">全选图集</button>
+<button class="secondary" id="profileResetRecords" type="button">清除已下载标记</button>
+</div>
 <div class="profile-choices" id="profileChoices">
 </div>
 <button class="ghost-link" hidden="" id="profileMore" type="button">显示更多作品</button>
@@ -13606,6 +13715,7 @@ h1{font-size:24px;letter-spacing:-.02em;font-weight:650}
 <details class="settings-block">
 <summary>下载历史 <span id="historyCount">0</span>
 </summary>
+<button class="ghost-link" hidden="" id="clearHistory" type="button">清空下载历史</button>
 <div id="historyList">
 </div>
 </details>
@@ -14876,6 +14986,12 @@ h1{font-size:24px;letter-spacing:-.02em;font-weight:650}
             this.q('#batchQueueMore').onclick = () => { this.batchQueueLimit = (this.batchQueueLimit || 50) + 50; this.renderBatchQueue(); };
             const history = this.q('#historyList').closest('details');
             history.addEventListener('toggle', () => { if (history.open) this.renderHistory(true); });
+            this.q('#clearHistory').onclick = () => this.safe(() => {
+                const count = (this.historyCache || DownloadHistory.get()).length;
+                DownloadHistory.clear();
+                this.renderHistory(true);
+                ToastCenter.update(count ? `已清空下载历史（${count} 条记录），已保存的文件不受影响` : '下载历史已经是空的', 3000);
+            });
             const style = document.createElement('style');
             style.textContent = `.batch-task-overview{padding:12px;margin:12px 0 14px;border:1px solid var(--border);border-radius:12px;background:var(--card)}.stalled-queue-bar{padding:12px;margin:12px 0 14px;border:1px solid #ebddc3;border-radius:12px;background:#fbf6ec}.stalled-queue-bar[hidden]{display:none}.stalled-queue-bar .hint{white-space:pre-line}.batch-heading{display:flex;align-items:center;justify-content:space-between;gap:8px}.batch-heading strong{min-width:0;font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.batch-outcomes{display:flex;flex-wrap:wrap;gap:4px 12px;margin-top:8px;color:var(--muted);font-size:11px;font-variant-numeric:lining-nums tabular-nums}.task-metrics{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:5px 10px;margin:7px 0;font-size:11px;color:var(--muted);font-variant-numeric:lining-nums tabular-nums}.task-metrics .task-percent{font-weight:650;color:var(--text);text-align:right}.task [data-task-field="statusText"]{margin:6px 0;overflow-wrap:anywhere}.task [data-task-field="method"]{overflow-wrap:anywhere}#batchQueue{margin-top:8px;font-size:11px;color:var(--muted)}#batchQueue summary{cursor:pointer}#batchQueueList>div{display:flex;gap:8px;justify-content:space-between;padding:7px 0;border-bottom:1px solid var(--border)}#batchQueueList strong{max-width:75%;font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}#taskList .task:first-child{margin-top:4px}.progress[data-unknown="true"] i{width:0!important}.profile-choice input:focus-visible{outline:2px solid var(--accent);outline-offset:2px}#page-tasks .task-toolbar{margin-top:12px}.task-stat-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;margin:10px 0 12px}.task-stat-grid>div{min-width:0;padding:9px 7px;border:1px solid var(--border);border-radius:9px;background:var(--card);text-align:center}.task-stat-grid span{display:block;font-size:10px;color:var(--muted);line-height:1.4}.task-stat-grid strong{display:block;margin-top:3px;font-size:16px;line-height:1.3;font-variant-numeric:lining-nums tabular-nums}.task-empty-state{display:grid;justify-items:center;text-align:center;gap:7px;padding:30px 12px 22px;color:var(--muted)}.task-empty-state[hidden]{display:none}.task-empty-state .task-empty-icon{display:grid;place-items:center;width:38px;height:38px;border-radius:10px;background:var(--muted-bg);color:var(--accent)}.task-empty-state strong{font-size:14px;color:var(--text)}.task-empty-state p{margin:0;font-size:11px}.task-actions{justify-content:flex-end}.task-primary-action{min-height:30px;padding:5px 10px;font-size:11px}.task-more{position:relative;margin-left:auto}.task-more>summary{display:grid;place-items:center;width:30px;height:30px;border-radius:7px;cursor:pointer;color:var(--muted);list-style:none}.task-more>summary::-webkit-details-marker{display:none}.task-more[open]>summary,.task-more>summary:hover{background:var(--hover);color:var(--text)}.task-more-menu{position:absolute;right:0;bottom:34px;z-index:5;display:grid;min-width:148px;padding:5px;border:1px solid var(--border);border-radius:9px;background:#fff;box-shadow:0 10px 26px #1b3b2f1a}.task-menu-item{border:0;background:transparent;text-align:left;padding:7px 9px;border-radius:6px;color:var(--text);font:11px/1.4 var(--font);cursor:pointer}.task-menu-item:hover{background:var(--hover)}.status.tone-active{color:var(--accent);background:var(--soft);border-color:#c8e1d6}.status.tone-info{color:#557a95;background:#f1f6f9;border-color:#d7e4ec}.status.tone-attention{color:#9a6a2e;background:#fbf6ec;border-color:#ebddc3}.status.tone-error{color:#a75454;background:#fbf1f1;border-color:#edd4d4}.status.tone-neutral{color:var(--muted);background:var(--muted-bg)}@media(max-width:340px){.task-stat-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}`;
             this.shadow.append(style);
@@ -14994,6 +15110,8 @@ h1{font-size:24px;letter-spacing:-.02em;font-weight:650}
             if (force || key !== this.historyRevision) {
                 this.historyRevision = key; this.historyCache = DownloadHistory.get();
                 this.setNodeText(this.q('#historyCount'), this.historyCache.length);
+                const clearButton = this.q('#clearHistory');
+                if (clearButton) clearButton.hidden = !this.historyCache.length;
                 this.historyHTML = null;
             }
             if (!expanded) return;
@@ -15133,7 +15251,7 @@ h1{font-size:24px;letter-spacing:-.02em;font-weight:650}
                 row._input.checked=manager.selectedIds.has(id);row._input.disabled=disabled;
                 const label='选择 '+title;if(row._input.getAttribute('aria-label')!==label)row._input.setAttribute('aria-label',label);
                 this.setNodeText(row.querySelector('strong'),title);this.setNodeText(row.querySelector('.profile-work-id'),id);
-                const kind=media?.images?.length || snap?.type==='album' ? '图集' : '视频';
+                const kind=ProfileWorkType.label(manager.mediaTypeOf(id));
                 const status=downloaded.has(id)?'已完成':manager.jobState?.submittedItems?.[id]?'已提交':manager.jobState?.failedItems?.[id]?'需处理':'';
                 this.setNodeText(row.querySelector('.profile-type-status'),kind+(status?' · '+status:''));
                 const createTime=Number(media?.createTime || snap?.createTime || 0);
@@ -15183,6 +15301,14 @@ h1{font-size:24px;letter-spacing:-.02em;font-weight:650}
             this.q('#profileSelectEntire').onclick = () => this.safe(() => scan(true));
             this.q('#profileSelectAll').onclick = () => { this.profile.downloadManager.collect(); this.profile.downloadManager.markSelectAll(true); this.renderProfile(); };
             this.q('#profileDeselect').onclick = () => { this.profile.downloadManager.markSelectAll(false); this.renderProfile(); };
+            const selectByType = (type) => { const manager = this.profile.downloadManager; manager.collect(); manager.markSelectByType(type); this.renderProfile(); };
+            this.q('#profileSelectVideos').onclick = () => selectByType('video');
+            this.q('#profileSelectAlbums').onclick = () => selectByType('album');
+            this.q('#profileResetRecords').onclick = () => {
+                const { downloaded, submitted } = this.profile.downloadManager.resetCompletionRecords();
+                this.renderProfile();
+                ToastCenter.update(`已清除 ${downloaded} 条已下载标记${submitted ? `和 ${submitted} 条已提交记录` : ''}，文件不受影响；这些作品现在会重新算作新任务`, 4200);
+            };
             this.q('#profileChoices').onchange = e => {
                 const box = e.target.closest('input[data-media-id]');
                 if (box) {
@@ -15263,6 +15389,23 @@ h1{font-size:24px;letter-spacing:-.02em;font-weight:650}
             for (const name of ['play', 'loadedmetadata']) document.addEventListener(name, () => this.queueProfileContextSync(), { ...opt, capture: true });
             this.observeDetailState();
         }
+        updateProfileTypeButtons(disabled) {
+            const manager = this.profile?.downloadManager;
+            if (!manager || !this.q('#profileSelectVideos')) return;
+            const counts = manager.getTypeCounts();
+            for (const [type, id, name] of [["video", "profileSelectVideos", "全选视频"], ["album", "profileSelectAlbums", "全选图集"]]) {
+                const button = this.q('#' + id);
+                this.setNodeText(button, `${name}（${counts[type]}）`);
+                button.disabled = disabled || !counts[type];
+            }
+            const records = manager.getCompletionRecordCounts();
+            const reset = this.q('#profileResetRecords');
+            if (reset) {
+                this.setNodeText(reset, `清除已下载标记（${records.downloaded}）`);
+                reset.title = `已下载 ${records.downloaded} · 已提交 ${records.submitted}；只清记账，不删除文件`;
+                reset.disabled = disabled || !records.downloaded && !records.submitted;
+            }
+        }
         updateProfileProgressSurface() {
             if (!this.q || !this.profileMode) return;
             const manager = this.profile.downloadManager;
@@ -15288,6 +15431,7 @@ h1{font-size:24px;letter-spacing:-.02em;font-weight:650}
             if (selectAll) selectAll.disabled = manager.discoveryScan.running || !stats.loaded;
             const deselect = this.q('#profileDeselect');
             if (deselect) deselect.disabled = manager.discoveryScan.running || !selection.selected;
+            this.updateProfileTypeButtons(manager.discoveryScan.running || !stats.loaded);
             this.setNodeText(this.q('#profileSummary'), `${manager.jobState?.profileName || this.profileContext?.profileName || '当前作者'} · 已选择 ${selection.selected} / 已载入 ${stats.loaded}`);
             if (this.tab === 'works' && !this.page) this.renderProfileFooter();
         }
@@ -15344,6 +15488,7 @@ h1{font-size:24px;letter-spacing:-.02em;font-weight:650}
             this.q('#profileSelectEntire').disabled = busy || foreign || !ProfileScene.isCollection(this.handler);
             this.q('#profileSelectAll').disabled = busy || foreign || !ids.length;
             this.q('#profileDeselect').disabled = busy || foreign || !selectionStats.selected;
+            this.updateProfileTypeButtons(busy || foreign);
             this.q('#profileCardToggle').checked = !!Config.global.features.enable_profile_downloader;
             this.q('#profileCardToggle').disabled = foreign || locked;
             const external = Config.global.features.using_downloader !== 'browser';
@@ -15464,6 +15609,7 @@ h1{font-size:24px;letter-spacing:-.02em;font-weight:650}
                 const note = warn ? TaskPersistence.RISK_COPY : (stats.active || stats.queued ? '收起面板不会停止任务；队列会继续在当前标签页执行。' : '');
                 const buttons = [
                     page.showRetryFailed ? '<button type="button" class="secondary" id="retryFailed">重试需处理项</button>' : '',
+                    page.showCancelAttention ? '<button type="button" class="secondary" id="cancelAttention">取消需处理项</button>' : '',
                     page.showClearDone ? '<button type="button" class="secondary" id="clearDone">清除已结束</button>' : '',
                 ].filter(Boolean).join('');
                 const taskFooter = `${note ? `<div class="footer-note task-risk-note"><span>${this.escape(note)}</span></div>` : ''}${buttons ? `<div class="btn-row">${buttons}</div>` : ''}`;
@@ -15473,6 +15619,24 @@ h1{font-size:24px;letter-spacing:-.02em;font-weight:650}
                 if (retry) retry.onclick = () => this.safe(async () => {
                     const targets = UnifiedTasks.list().filter(task => [TaskState.FAILED, TaskState.UNAVAILABLE].includes(task.state));
                     for (const task of targets) await this.handleTaskAction(task, task.state === TaskState.UNAVAILABLE ? 'recheck' : 'retry');
+                });
+                const cancelAttention = this.q('#cancelAttention');
+                if (cancelAttention) cancelAttention.onclick = () => this.safe(() => {
+                    const attentionStates = [TaskState.FAILED, TaskState.UNAVAILABLE, TaskState.INTERRUPTED, TaskState.BLOCKED];
+                    const targets = UnifiedTasks.list().filter(task => attentionStates.includes(normalizeTaskState(task.state || task.phase)));
+                    if (!targets.length) throw new Error('没有需处理任务');
+                    const manager = this.profile?.downloadManager || null;
+                    for (const task of targets) {
+                        this.handler.scheduler.cancelTask(task.id);
+                        if (manager && task.workId) {
+                            manager.failureRuntime?.delete?.(String(task.workId));
+                            delete manager.jobState?.failedItems?.[task.workId];
+                        }
+                    }
+                    manager?._saveJobState?.();
+                    this.handler.taskPersistence?.saveSession?.('attention-cancelled');
+                    this.renderTasks();
+                    ToastCenter.update(`已取消 ${targets.length} 项需处理任务，已保存的文件不会删除`, 3200);
                 });
                 const clear = this.q('#clearDone');
                 if (clear) clear.onclick = () => {
@@ -15868,6 +16032,8 @@ h1{font-size:24px;letter-spacing:-.02em;font-weight:650}
     taskPersistence.restoreSession();
     taskPersistence.bind();
     mediaHandler.taskPersistence = taskPersistence;
+    const staleSessionKeys = taskPersistence.pruneStaleSessions();
+    if (staleSessionKeys) console.log(`[抖音下载] 已清理 ${staleSessionKeys} 份历史任务会话快照`);
     const danmakuHandler = new DanmakuHandler();
     const profilePageHandler = new ProfilePageHandler({
         mediaHandler,
@@ -15909,6 +16075,7 @@ h1{font-size:24px;letter-spacing:-.02em;font-weight:650}
     hotkeyManager.addHotkey("m", () => mediaHandler.download_current_media());
     const promptStalledQueueAfterRestore = async () => {
         const scheduler = mediaHandler.scheduler;
+        const workbench = mediaHandler.workbench;
         if (!scheduler || mediaHandler.stalledQueuePrompted) return;
         const stats = TaskStatsPolicy.from(UnifiedTasks.list());
         if (!stats.queued || scheduler.activeId || scheduler.pumping || scheduler.pumpScheduled) return;
@@ -15919,18 +16086,18 @@ h1{font-size:24px;letter-spacing:-.02em;font-weight:650}
             .filter(task => normalizeTaskState(task.state) === TaskState.QUEUED && task.groupId)
             .map(task => task.groupId));
         const pausedGroups = [...scheduler.groupPaused].filter(groupId => queuedGroups.has(groupId));
-        const ok = await ProductDialog.open({
+        // choiceValues 让「取消」与右上角关闭区分开：关窗仍是先不处理，按钮才会真正落取消。
+        const choice = await ProductDialog.open({
             title: '有任务在等待，但队列没有运行',
             message: `${stats.queued} 项处于等待中，当前没有任务在处理${pausedGroups.length ? '，其中包含已暂停的批量组' : ''}。`,
-            detail: '页面刷新后脚本不会自动续跑。开始全部会把它们重新排入队列；若保存位置已随刷新失效，头几项会变成“需要授权”，在任意一条上点“修复保存位置”重选目录，同组任务会一起继续。',
+            detail: '开始全部会把它们重新排入队列；取消全部会把等待项标记为已取消，已保存的文件不会删除。若保存位置已随刷新失效，头几项会变成“需要授权”，在任意一条上点“修复保存位置”重选目录，同组任务会一起继续。',
             primaryLabel: pausedGroups.length ? '解除暂停并开始全部' : '开始全部等待项',
-            secondaryLabel: '先不处理',
+            secondaryLabel: '取消全部等待项',
+            choiceValues: { primary: 'start', secondary: 'cancel' },
         });
-        if (!ok) return;
-        for (const groupId of pausedGroups) scheduler.resumeGroup(groupId);
-        const { total } = scheduler.startQueuedTasks();
-        mediaHandler.workbench?.renderTasks?.();
-        if (total) ToastCenter.update(`已把 ${total} 项等待任务交给队列`, 3200);
+        if (choice !== 'start' && choice !== 'cancel') return;
+        if (!workbench) return;
+        void workbench.safe(() => workbench.stalledQueueAction(choice));
     };
     setTimeout(() => { void promptStalledQueueAfterRestore(); }, 1500);
     console.log("[抖音下载] 2.1.2 已启动");
