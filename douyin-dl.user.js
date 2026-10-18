@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name          抖音下载（网页版）
+// @name          抖音下载（网页版）·队列可续跑补丁
 // @namespace     https://github.com/xiaohuitongxue88-ctrl/douyin-downloader
-// @version       2.1.2
-// @description   抖音作品下载与整理：统一任务队列、视频与图集保存、自愈恢复、安全断点续传、作者主页批量任务。
+// @version       2.1.2-patch1
+// @description   基于 2.1.2 的本地补丁：等待中的任务可单个或整批开始，刷新后队列停摆会弹确认框提示继续。
 // @author        小辉同學
 // @match         https://*.douyin.com/*
 // @icon          data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAzMiAzMiI+PHJlY3Qgd2lkdGg9IjMyIiBoZWlnaHQ9IjMyIiByeD0iOSIgZmlsbD0iI2YwZmFmNSIvPjxwYXRoIGQ9Ik0xMyA1TDE2IDEyTDIzIDE1TDE2IDE4TDEzIDI1TDEwIDE4TDMgMTVMMTAgMTJaIiBmaWxsPSIjMmY5ZWFhIi8+PHBhdGggZD0iTTI2IDN2OE0yMiA3aDgiIHN0cm9rZT0iI2M0OTYzNiIgc3Ryb2tlLXdpZHRoPSIyIi8+PC9zdmc+
@@ -22,6 +22,7 @@
 // @grant         GM_setClipboard
 // @grant         GM.setClipboard
 // @connect       *
+// 本地补丁版：已移除 @downloadURL / @updateURL，避免 Greasyfork 在线更新覆盖补丁。
 // ==/UserScript==
 /*
  * Copyright © 2026 小辉同學
@@ -2620,7 +2621,7 @@ button:hover .dy-copy .front-copy,button:focus-visible .dy-copy .front-copy{anim
             const state = normalizeTaskState(task?.state || task?.phase || TaskState.QUEUED);
             if (ACTIVE_TASK_STATES.has(state)) return { primary: "pause", more: ["cancel", "details"] };
             switch (state) {
-                case TaskState.QUEUED: return { primary: null, more: ["cancel", "remove"] };
+                case TaskState.QUEUED: return { primary: "start", more: ["cancel", "remove"] };
                 case TaskState.PAUSED: return { primary: "resume", more: ["restart", "cancel", "remove", "details"] };
                 case TaskState.INTERRUPTED: return { primary: "recover", more: ["recheck", "restart", "cancel", "remove", "details"] };
                 case TaskState.BLOCKED: return { primary: "repair", more: ["cancel", "remove", "details"] };
@@ -3771,6 +3772,23 @@ button:hover .dy-copy .front-copy,button:focus-visible .dy-copy .front-copy{anim
             if (!this.queue.includes(id)) this.queue.push(id);
             this._schedulePump();
             return true;
+        }
+        startTask(id) {
+            const task = this.store.get(id);
+            if (!task) return false;
+            if (normalizeTaskState(task.state) !== TaskState.QUEUED) return this.resumeTask(id);
+            if (task.groupId && this.groupPaused.has(task.groupId)) return false;
+            const index = this.queue.indexOf(id);
+            if (index > 0) this.queue.splice(index, 1);
+            if (index !== 0) this.queue.unshift(id);
+            this._schedulePump();
+            return true;
+        }
+        startQueuedTasks() {
+            const tasks = this.store.list().filter(task => normalizeTaskState(task.state) === TaskState.QUEUED);
+            for (const task of tasks) if (!this.queue.includes(task.id)) this.queue.push(task.id);
+            if (tasks.length) this._schedulePump();
+            return { total: tasks.length, blockedByGroup: tasks.filter(task => task.groupId && this.groupPaused.has(task.groupId)).length };
         }
         cancelTask(id) {
             const task = this.store.get(id);
@@ -13574,6 +13592,7 @@ h1{font-size:24px;letter-spacing:-.02em;font-weight:650}
 <input aria-label="搜索任务" class="setting-input" id="taskSearch" placeholder="搜索作品或文件名"/>
 <select aria-label="按状态筛选" class="setting-input" id="taskFilter">
 <option value="all">全部状态</option>
+<option value="queued">等待中</option>
 <option value="downloading">下载中</option>
 <option value="paused">已暂停</option>
 <option value="attention">需处理</option>
@@ -14584,7 +14603,7 @@ h1{font-size:24px;letter-spacing:-.02em;font-weight:650}
         }
         taskActionLabel(action) {
             return ({
-                pause: '暂停', resume: '继续', recover: '恢复任务', restart: '重新下载', repair: '修复保存位置',
+                start: '开始下载', pause: '暂停', resume: '继续', recover: '恢复任务', restart: '重新下载', repair: '修复保存位置',
                 retry: '重试', recheck: '重新检查', cancel: '取消任务', remove: '移除任务', details: '查看详情',
                 resubmit: '重新提交', redownload: '重新下载', clear: '清除记录', requeue: '重新加入队列',
             })[action] || action;
@@ -14706,6 +14725,14 @@ h1{font-size:24px;letter-spacing:-.02em;font-weight:650}
                 UnifiedTasks.patch(task.id, { status: '正在暂停…' });
                 return true;
             }
+            if (action === 'start') {
+                if (task.groupId && scheduler.groupPaused?.has(task.groupId))
+                    throw new Error('该任务所属的批量组已暂停，请用任务列表顶部的批量队列提示解除整组暂停。');
+                if (!scheduler.startTask(task.id)) throw new Error('当前任务暂时无法开始');
+                this.handler.taskPersistence?.scheduleSave?.(400);
+                this.renderTasks();
+                return true;
+            }
             if (action === 'resume' || action === 'recover') {
                 if (!scheduler.resumeTask(task.id)) throw new Error('当前任务暂时无法继续');
                 return true;
@@ -14787,6 +14814,7 @@ h1{font-size:24px;letter-spacing:-.02em;font-weight:650}
             const row = this.taskRows?.get(change.taskId);
             if (task && row?.isConnected) this.paintTaskRow(row, task, this.taskLabels());
             this.renderBatchOverview(UnifiedTasks.list());
+            this.renderStalledQueueBar(UnifiedTasks.list());
         }
         renderTaskPageState(jobs = UnifiedTasks.list()) {
             const stats = TaskStatsPolicy.from(jobs);
@@ -14834,6 +14862,14 @@ h1{font-size:24px;letter-spacing:-.02em;font-weight:650}
                 const button = event.target.closest('[data-batch-action]');
                 if (button && !button.disabled) this.safe(() => this.batchAction(button.dataset.batchAction));
             });
+            const stalled = document.createElement('section');
+            stalled.id = 'stalledQueueBar'; stalled.className = 'stalled-queue-bar'; stalled.hidden = true;
+            stalled.innerHTML = `<div class="batch-heading"><strong data-stalled="title">队列已停摆</strong><span class="status warn" data-stalled="phase"></span></div><p class="hint" data-stalled="detail"></p><div class="task-actions" id="stalledQueueActions"></div>`;
+            overview.after(stalled);
+            stalled.addEventListener('click', event => {
+                const button = event.target.closest('[data-stalled-action]');
+                if (button && !button.disabled) this.safe(() => this.stalledQueueAction(button.dataset.stalledAction));
+            });
             this.q('#batchQueue').addEventListener('toggle', () => {
                 if (this.q('#batchQueue').open && this.opened && this.tab === 'tasks') this.renderBatchQueue();
             });
@@ -14841,7 +14877,7 @@ h1{font-size:24px;letter-spacing:-.02em;font-weight:650}
             const history = this.q('#historyList').closest('details');
             history.addEventListener('toggle', () => { if (history.open) this.renderHistory(true); });
             const style = document.createElement('style');
-            style.textContent = `.batch-task-overview{padding:12px;margin:12px 0 14px;border:1px solid var(--border);border-radius:12px;background:var(--card)}.batch-heading{display:flex;align-items:center;justify-content:space-between;gap:8px}.batch-heading strong{min-width:0;font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.batch-outcomes{display:flex;flex-wrap:wrap;gap:4px 12px;margin-top:8px;color:var(--muted);font-size:11px;font-variant-numeric:lining-nums tabular-nums}.task-metrics{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:5px 10px;margin:7px 0;font-size:11px;color:var(--muted);font-variant-numeric:lining-nums tabular-nums}.task-metrics .task-percent{font-weight:650;color:var(--text);text-align:right}.task [data-task-field="statusText"]{margin:6px 0;overflow-wrap:anywhere}.task [data-task-field="method"]{overflow-wrap:anywhere}#batchQueue{margin-top:8px;font-size:11px;color:var(--muted)}#batchQueue summary{cursor:pointer}#batchQueueList>div{display:flex;gap:8px;justify-content:space-between;padding:7px 0;border-bottom:1px solid var(--border)}#batchQueueList strong{max-width:75%;font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}#taskList .task:first-child{margin-top:4px}.progress[data-unknown="true"] i{width:0!important}.profile-choice input:focus-visible{outline:2px solid var(--accent);outline-offset:2px}#page-tasks .task-toolbar{margin-top:12px}.task-stat-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;margin:10px 0 12px}.task-stat-grid>div{min-width:0;padding:9px 7px;border:1px solid var(--border);border-radius:9px;background:var(--card);text-align:center}.task-stat-grid span{display:block;font-size:10px;color:var(--muted);line-height:1.4}.task-stat-grid strong{display:block;margin-top:3px;font-size:16px;line-height:1.3;font-variant-numeric:lining-nums tabular-nums}.task-empty-state{display:grid;justify-items:center;text-align:center;gap:7px;padding:30px 12px 22px;color:var(--muted)}.task-empty-state[hidden]{display:none}.task-empty-state .task-empty-icon{display:grid;place-items:center;width:38px;height:38px;border-radius:10px;background:var(--muted-bg);color:var(--accent)}.task-empty-state strong{font-size:14px;color:var(--text)}.task-empty-state p{margin:0;font-size:11px}.task-actions{justify-content:flex-end}.task-primary-action{min-height:30px;padding:5px 10px;font-size:11px}.task-more{position:relative;margin-left:auto}.task-more>summary{display:grid;place-items:center;width:30px;height:30px;border-radius:7px;cursor:pointer;color:var(--muted);list-style:none}.task-more>summary::-webkit-details-marker{display:none}.task-more[open]>summary,.task-more>summary:hover{background:var(--hover);color:var(--text)}.task-more-menu{position:absolute;right:0;bottom:34px;z-index:5;display:grid;min-width:148px;padding:5px;border:1px solid var(--border);border-radius:9px;background:#fff;box-shadow:0 10px 26px #1b3b2f1a}.task-menu-item{border:0;background:transparent;text-align:left;padding:7px 9px;border-radius:6px;color:var(--text);font:11px/1.4 var(--font);cursor:pointer}.task-menu-item:hover{background:var(--hover)}.status.tone-active{color:var(--accent);background:var(--soft);border-color:#c8e1d6}.status.tone-info{color:#557a95;background:#f1f6f9;border-color:#d7e4ec}.status.tone-attention{color:#9a6a2e;background:#fbf6ec;border-color:#ebddc3}.status.tone-error{color:#a75454;background:#fbf1f1;border-color:#edd4d4}.status.tone-neutral{color:var(--muted);background:var(--muted-bg)}@media(max-width:340px){.task-stat-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}`;
+            style.textContent = `.batch-task-overview{padding:12px;margin:12px 0 14px;border:1px solid var(--border);border-radius:12px;background:var(--card)}.stalled-queue-bar{padding:12px;margin:12px 0 14px;border:1px solid #ebddc3;border-radius:12px;background:#fbf6ec}.stalled-queue-bar[hidden]{display:none}.stalled-queue-bar .hint{white-space:pre-line}.batch-heading{display:flex;align-items:center;justify-content:space-between;gap:8px}.batch-heading strong{min-width:0;font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.batch-outcomes{display:flex;flex-wrap:wrap;gap:4px 12px;margin-top:8px;color:var(--muted);font-size:11px;font-variant-numeric:lining-nums tabular-nums}.task-metrics{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:5px 10px;margin:7px 0;font-size:11px;color:var(--muted);font-variant-numeric:lining-nums tabular-nums}.task-metrics .task-percent{font-weight:650;color:var(--text);text-align:right}.task [data-task-field="statusText"]{margin:6px 0;overflow-wrap:anywhere}.task [data-task-field="method"]{overflow-wrap:anywhere}#batchQueue{margin-top:8px;font-size:11px;color:var(--muted)}#batchQueue summary{cursor:pointer}#batchQueueList>div{display:flex;gap:8px;justify-content:space-between;padding:7px 0;border-bottom:1px solid var(--border)}#batchQueueList strong{max-width:75%;font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}#taskList .task:first-child{margin-top:4px}.progress[data-unknown="true"] i{width:0!important}.profile-choice input:focus-visible{outline:2px solid var(--accent);outline-offset:2px}#page-tasks .task-toolbar{margin-top:12px}.task-stat-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;margin:10px 0 12px}.task-stat-grid>div{min-width:0;padding:9px 7px;border:1px solid var(--border);border-radius:9px;background:var(--card);text-align:center}.task-stat-grid span{display:block;font-size:10px;color:var(--muted);line-height:1.4}.task-stat-grid strong{display:block;margin-top:3px;font-size:16px;line-height:1.3;font-variant-numeric:lining-nums tabular-nums}.task-empty-state{display:grid;justify-items:center;text-align:center;gap:7px;padding:30px 12px 22px;color:var(--muted)}.task-empty-state[hidden]{display:none}.task-empty-state .task-empty-icon{display:grid;place-items:center;width:38px;height:38px;border-radius:10px;background:var(--muted-bg);color:var(--accent)}.task-empty-state strong{font-size:14px;color:var(--text)}.task-empty-state p{margin:0;font-size:11px}.task-actions{justify-content:flex-end}.task-primary-action{min-height:30px;padding:5px 10px;font-size:11px}.task-more{position:relative;margin-left:auto}.task-more>summary{display:grid;place-items:center;width:30px;height:30px;border-radius:7px;cursor:pointer;color:var(--muted);list-style:none}.task-more>summary::-webkit-details-marker{display:none}.task-more[open]>summary,.task-more>summary:hover{background:var(--hover);color:var(--text)}.task-more-menu{position:absolute;right:0;bottom:34px;z-index:5;display:grid;min-width:148px;padding:5px;border:1px solid var(--border);border-radius:9px;background:#fff;box-shadow:0 10px 26px #1b3b2f1a}.task-menu-item{border:0;background:transparent;text-align:left;padding:7px 9px;border-radius:6px;color:var(--text);font:11px/1.4 var(--font);cursor:pointer}.task-menu-item:hover{background:var(--hover)}.status.tone-active{color:var(--accent);background:var(--soft);border-color:#c8e1d6}.status.tone-info{color:#557a95;background:#f1f6f9;border-color:#d7e4ec}.status.tone-attention{color:#9a6a2e;background:#fbf6ec;border-color:#ebddc3}.status.tone-error{color:#a75454;background:#fbf1f1;border-color:#edd4d4}.status.tone-neutral{color:var(--muted);background:var(--muted-bg)}@media(max-width:340px){.task-stat-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}`;
             this.shadow.append(style);
         }
         taskLabels() {
@@ -14918,6 +14954,7 @@ h1{font-size:24px;letter-spacing:-.02em;font-weight:650}
             jobs.sort((a,b) => statePriority(a.state)-statePriority(b.state) || (b.createdAt || 0)-(a.createdAt || 0));
             const page = this.renderTaskPageState(jobs);
             this.renderBatchOverview(jobs);
+            this.renderStalledQueueBar(jobs);
             const search = this.q('#taskSearch').value.trim().toLowerCase(), filter = this.q('#taskFilter').value;
             const source = page.policy.empty ? [] : jobs;
             const filtered = source.filter(job => {
@@ -15010,6 +15047,59 @@ h1{font-size:24px;letter-spacing:-.02em;font-weight:650}
             const html=items.slice(0,this.batchQueueLimit || 50).map((task,i)=>`<div><strong title="${this.escape(task.title || task.workId)}">${i+1}. ${this.escape(task.title || task.workId)}</strong><span>${this.escape(TaskViewPolicy.for(task).statusLabel)}</span></div>`).join('');
             if (this.batchQueueHTML!==html) { this.batchQueueHTML=html; this.q('#batchQueueList').innerHTML=html; }
             this.q('#batchQueueMore').hidden=items.length<=(this.batchQueueLimit || 50);
+        }
+        stalledQueueSnapshot(jobs = UnifiedTasks.list()) {
+            const scheduler = this.handler.scheduler;
+            const queued = jobs.filter(job => normalizeTaskState(job.state || job.phase) === TaskState.QUEUED);
+            const running = Boolean(scheduler?.activeId || scheduler?.pumping || scheduler?.pumpScheduled);
+            const pausedGroups = [...(scheduler?.groupPaused || [])].filter(groupId => queued.some(job => job.groupId === groupId));
+            const ownershipBlocked = Boolean(scheduler?.ownershipBlocked);
+            const remote = ownershipBlocked ? this.handler.tabCoordinator?.getRemoteStatus?.() || null : null;
+            return { scheduler, queued, running, pausedGroups, ownershipBlocked, remote };
+        }
+        renderStalledQueueBar(jobs = UnifiedTasks.list()) {
+            const box = this.q('#stalledQueueBar');
+            if (!box) return;
+            const { queued, running, pausedGroups, ownershipBlocked, remote } = this.stalledQueueSnapshot(jobs);
+            const show = queued.length > 0 && !running;
+            box.hidden = !show;
+            if (!show) { this.stalledActionsHTML = null; return; }
+            const groupCount = pausedGroups.reduce((sum, groupId) => sum + queued.filter(job => job.groupId === groupId).length, 0);
+            this.setNodeText(box.querySelector('[data-stalled="title"]'), `${queued.length} 项等待中，队列没有运行`);
+            const phase = box.querySelector('[data-stalled="phase"]');
+            phase.className = 'status ' + (ownershipBlocked || groupCount ? 'warn' : 'processing');
+            this.setNodeText(phase, ownershipBlocked ? '下载通道被占用' : groupCount ? '整组已暂停' : '尚未开始');
+            const detail = box.querySelector('[data-stalled="detail"]');
+            const lines = [];
+            if (ownershipBlocked) lines.push(`另一个标签页正持有下载通道${remote?.title ? `（${remote.title}）` : ''}，本标签页不会开始任务。`);
+            if (groupCount) lines.push(`其中 ${groupCount} 项属于已暂停的批量组，点“开始全部”会一并解除整组暂停。`);
+            if (!ownershipBlocked && !groupCount) lines.push('刷新页面后脚本不会自动续跑。若保存位置已随刷新失效，头几项会变成“需要授权”，在任意一条上点“修复保存位置”重选目录，同组任务会一起继续。');
+            this.setNodeText(detail, lines.join('\n'));
+            const html = `<button type="button" class="primary" data-stalled-action="start">${groupCount ? '解除暂停并开始全部' : '开始全部'} ${queued.length} 项</button>`
+                + `<button type="button" class="secondary" data-stalled-action="cancel">取消全部等待项</button>`;
+            if (html !== this.stalledActionsHTML) { this.stalledActionsHTML = html; this.q('#stalledQueueActions').innerHTML = html; }
+        }
+        async stalledQueueAction(action) {
+            const scheduler = this.handler.scheduler;
+            if (!scheduler) throw new Error('任务调度器尚未就绪');
+            const { queued, pausedGroups } = this.stalledQueueSnapshot();
+            if (!queued.length) throw new Error('没有等待中的任务');
+            if (action === 'start') {
+                for (const groupId of pausedGroups) scheduler.resumeGroup(groupId);
+                const { total } = scheduler.startQueuedTasks();
+                this.handler.taskPersistence?.saveSession?.('stalled-queue-started');
+                this.renderTasks();
+                ToastCenter.update(total ? `已把 ${total} 项等待任务交给队列` : '没有可开始的任务', 3200);
+                return;
+            }
+            if (action === 'cancel') {
+                const ok = await ProductDialog.open({ title: '取消全部等待中的任务？', detail: `${queued.length} 项会标记为已取消，已保存的文件不会删除。`, primaryLabel: '取消任务', secondaryLabel: '继续保留' });
+                if (!ok) return;
+                for (const job of queued) scheduler.cancelTask(job.id);
+                this.handler.taskPersistence?.saveSession?.('stalled-queue-cancelled');
+                this.renderTasks();
+                ToastCenter.update(`已取消 ${queued.length} 项等待任务`, 3000);
+            }
         }
         async batchAction(action) {
             const m=this.profile.downloadManager;
@@ -15817,6 +15907,32 @@ h1{font-size:24px;letter-spacing:-.02em;font-weight:650}
     profilePageHandler.mount_ui();
     ProjectSupport.init(mediaHandler, profilePageHandler);
     hotkeyManager.addHotkey("m", () => mediaHandler.download_current_media());
+    const promptStalledQueueAfterRestore = async () => {
+        const scheduler = mediaHandler.scheduler;
+        if (!scheduler || mediaHandler.stalledQueuePrompted) return;
+        const stats = TaskStatsPolicy.from(UnifiedTasks.list());
+        if (!stats.queued || scheduler.activeId || scheduler.pumping || scheduler.pumpScheduled) return;
+        const remote = tabCoordinator.getRemoteStatus();
+        if (remote?.alive && Number(remote.active || 0) > 0) return;
+        mediaHandler.stalledQueuePrompted = true;
+        const queuedGroups = new Set(UnifiedTasks.list()
+            .filter(task => normalizeTaskState(task.state) === TaskState.QUEUED && task.groupId)
+            .map(task => task.groupId));
+        const pausedGroups = [...scheduler.groupPaused].filter(groupId => queuedGroups.has(groupId));
+        const ok = await ProductDialog.open({
+            title: '有任务在等待，但队列没有运行',
+            message: `${stats.queued} 项处于等待中，当前没有任务在处理${pausedGroups.length ? '，其中包含已暂停的批量组' : ''}。`,
+            detail: '页面刷新后脚本不会自动续跑。开始全部会把它们重新排入队列；若保存位置已随刷新失效，头几项会变成“需要授权”，在任意一条上点“修复保存位置”重选目录，同组任务会一起继续。',
+            primaryLabel: pausedGroups.length ? '解除暂停并开始全部' : '开始全部等待项',
+            secondaryLabel: '先不处理',
+        });
+        if (!ok) return;
+        for (const groupId of pausedGroups) scheduler.resumeGroup(groupId);
+        const { total } = scheduler.startQueuedTasks();
+        mediaHandler.workbench?.renderTasks?.();
+        if (total) ToastCenter.update(`已把 ${total} 项等待任务交给队列`, 3200);
+    };
+    setTimeout(() => { void promptStalledQueueAfterRestore(); }, 1500);
     console.log("[抖音下载] 2.1.2 已启动");
 })();
 
