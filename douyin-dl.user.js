@@ -2,7 +2,7 @@
 // @name          抖音下载（网页版）·队列可续跑补丁
 // @namespace     https://github.com/xiaohuitongxue88-ctrl/douyin-downloader
 // @version       2.1.2-patch2
-// @description   基于 2.1.2 的本地补丁：等待中的任务可单个或整批开始，队列停摆弹窗可一键开始或取消全部；作者作品支持按视频/图集分开批量勾选，并可清除已下载/已提交标记；任务页可批量取消需处理项；修复取消后刷新又变回等待中（不再回收过期会话快照并定期清理残留）；修复图集按文件夹/逐张保存时只存第一张、文件名未带作品名。
+// @description   基于 2.1.2 的本地补丁：等待中的任务可单个或整批开始，队列停摆弹窗可一键开始或取消全部；作者作品支持按视频/图集分开批量勾选，并可清除已下载/已提交标记；任务页可批量取消需处理项；修复取消后刷新又变回等待中（不再回收过期会话快照并定期清理残留）；修复图集按文件夹/逐张保存时只存第一张、文件名未带作品名；图集内新增 1-5 路并发传输（默认 1，保持逐张依次）。
 // @author        小辉同學
 // @match         https://*.douyin.com/*
 // @icon          data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAzMiAzMiI+PHJlY3Qgd2lkdGg9IjMyIiBoZWlnaHQ9IjMyIiByeD0iOSIgZmlsbD0iI2YwZmFmNSIvPjxwYXRoIGQ9Ik0xMyA1TDE2IDEyTDIzIDE1TDE2IDE4TDEzIDI1TDEwIDE4TDMgMTVMMTAgMTJaIiBmaWxsPSIjMmY5ZWFhIi8+PHBhdGggZD0iTTI2IDN2OE0yMiA3aDgiIHN0cm9rZT0iI2M0OTYzNiIgc3Ryb2tlLXdpZHRoPSIyIi8+PC9zdmc+
@@ -1595,6 +1595,7 @@ button:hover .dy-copy .front-copy,button:focus-visible .dy-copy .front-copy{anim
             enable_profile_downloader: false,
             album_output: "zip",
             batch_album_output: "folder",
+            album_concurrency: 1,
             include_description: false,
             file_conflict: "both",
             ui_theme: "light",
@@ -2221,6 +2222,25 @@ button:hover .dy-copy .front-copy,button:focus-visible .dy-copy .front-copy{anim
                     }
                 }
                 throw new Error('同名文件过多，请选择其他保存位置');
+            });
+        },
+        async useOrCreateDirectory(parent, name) {
+            return this.locked(async () => {
+                const safe = normalizeFilename(name, { maxLength: 180 });
+                for (let n = 0; n < 10000; n++) {
+                    const candidate = n ? `${safe} (${n})` : safe;
+                    try {
+                        // 已存在同名目录时直接复用：作者目录要跨作品共用一层，不像作品目录那样各建一个。
+                        return { handle: await parent.getDirectoryHandle(candidate), name: candidate };
+                    }
+                    catch (error) {
+                        if (this.isMissing(error))
+                            return { handle: await parent.getDirectoryHandle(candidate, { create: true }), name: candidate };
+                        if (error?.name !== 'TypeMismatchError')
+                            throw error;
+                    }
+                }
+                throw new Error('同名条目过多，请更换保存目录');
             });
         },
         async makeDirectory(parent, name) {
@@ -3441,6 +3461,8 @@ button:hover .dy-copy .front-copy,button:focus-visible .dy-copy .front-copy{anim
 
     class TabOwnershipCoordinator {
         static LEASE_KEY = "__douyin-dl-executor-owner-v210__";
+        static ALIVE_PREFIX = "__douyin-dl-tab-alive-v210__:";
+        static ALIVE_TTL_MS = 60000;
         static LOCK_NAME = "douyin-dl-executor-v210";
         constructor(options = {}) {
             this.tabId = String(options.tabId || "");
@@ -3451,6 +3473,7 @@ button:hover .dy-copy .front-copy,button:focus-visible .dy-copy .front-copy{anim
             this.heartbeatEnabled = options.heartbeat !== false;
             this.heartbeatTimer = 0;
             this.expiryTimer = 0;
+            this.presenceTimer = 0;
             this.availableListeners = new Set();
             this.remoteStatus = null;
             this.channel = options.channel || null;
@@ -3464,6 +3487,40 @@ button:hover .dy-copy .front-copy,button:focus-visible .dy-copy .front-copy{anim
                 const raw = this.storage?.getItem?.(TabOwnershipCoordinator.LEASE_KEY);
                 return raw ? JSON.parse(raw) : null;
             } catch { return null; }
+        }
+        touchPresence() {
+            if (!this.tabId || !this.storage?.setItem) return false;
+            try {
+                this.storage.setItem(TabOwnershipCoordinator.ALIVE_PREFIX + this.tabId, String(Number(this.now()) || Date.now()));
+                return true;
+            } catch { return false; }
+        }
+        startPresence() {
+            if (!this.tabId) return;
+            this.touchPresence();
+            if (this.presenceTimer || !this.setIntervalFn) return;
+            this.presenceTimer = this.setIntervalFn(() => this.touchPresence(), Math.min(5000, this.leaseTtl));
+        }
+        stopPresence() {
+            if (this.presenceTimer && this.clearIntervalFn) this.clearIntervalFn(this.presenceTimer);
+            this.presenceTimer = 0;
+            try { this.storage?.removeItem?.(TabOwnershipCoordinator.ALIVE_PREFIX + this.tabId); } catch {}
+        }
+        /** 仍然开着的标签页 id。租约只在执行任务期间持有，空闲页面只能靠这个注册表辨认。 */
+        liveTabIds(now = Number(this.now()) || Date.now()) {
+            const ids = new Set();
+            const ttl = Math.max(TabOwnershipCoordinator.ALIVE_TTL_MS, this.leaseTtl);
+            try {
+                for (let i = (this.storage?.length || 0) - 1; i >= 0; i--) {
+                    const key = this.storage.key(i);
+                    if (!key?.startsWith(TabOwnershipCoordinator.ALIVE_PREFIX)) continue;
+                    const tabId = key.slice(TabOwnershipCoordinator.ALIVE_PREFIX.length);
+                    const seen = Number(this.storage.getItem(key)) || 0;
+                    if (tabId && now - seen <= ttl) ids.add(tabId);
+                    else try { this.storage.removeItem(key); } catch {}
+                }
+            } catch {}
+            return ids;
         }
         _writeLease(taskId = "") {
             if (!this.tabId || !this.storage?.setItem) return false;
@@ -3581,6 +3638,7 @@ button:hover .dy-copy .front-copy,button:focus-visible .dy-copy .front-copy{anim
         }
         dispose() {
             this._stopHeartbeat();
+            this.stopPresence();
             if (this.expiryTimer && this.clearTimeoutFn) this.clearTimeoutFn(this.expiryTimer);
             this.expiryTimer = 0;
             try { this.channel?.close?.(); } catch {}
@@ -4015,6 +4073,7 @@ button:hover .dy-copy .front-copy,button:focus-visible .dy-copy .front-copy{anim
             this.saveTimer = 0;
             this.bound = false;
             this.sessionSavedAt = 0;
+            this.cancelledIds = new Set();
             this.hidden = Boolean(document.hidden);
             this.offTaskChange = null;
         }
@@ -4032,35 +4091,52 @@ button:hover .dy-copy .front-copy,button:focus-visible .dy-copy .front-copy{anim
         }
         _allSessions() {
             const sessions = {};
+            const live = this.tabCoordinator?.liveTabIds?.() || new Set();
             try {
                 for (let i = 0; i < localStorage.length; i++) {
                     const key = localStorage.key(i);
                     if (!key?.startsWith(TaskPersistence.STORAGE_PREFIX)) continue;
                     const tabId = key.slice(TaskPersistence.STORAGE_PREFIX.length);
+                    // 还开着的标签页的会话不是孤儿：导进来只会让同一批任务在两个页面里各自复活。
+                    if (!tabId || tabId === this.tabId || live.has(tabId)) continue;
                     const session = this._readSession(key);
-                    if (tabId && session?.tasks) sessions[tabId] = session;
+                    if (session?.tasks) sessions[tabId] = session;
                 }
             } catch {}
             return sessions;
         }
         // 历史标签页的会话快照只在“被别的标签页回收”时才会删除；残留越多，越容易在取消等待项后被重新导入。
-        // 这里清掉“已被本标签页落盘覆盖、且超过宽限期”的键，宽限期留给仍然开着但没写过盘的标签页。
+        // 这里清掉“已被本标签页落盘覆盖、且超过宽限期”的键；_allSessions 已排除本页面与仍开着的页面。
         pruneStaleSessions() {
             const now = Date.now();
-            const lease = this.tabCoordinator?.readLease?.() || null;
-            const liveOwner = TabOwnershipPolicy.isLeaseAlive(lease, now) ? String(lease?.tabId || "") : "";
             let removed = 0;
-            for (let i = localStorage.length - 1; i >= 0; i--) {
-                const key = localStorage.key(i);
-                if (!key?.startsWith(TaskPersistence.STORAGE_PREFIX)) continue;
-                const tabId = key.slice(TaskPersistence.STORAGE_PREFIX.length);
-                if (!tabId || tabId === this.tabId || tabId === liveOwner) continue;
-                const savedAt = Number(this._readSession(key)?.savedAt || 0);
+            for (const [tabId, session] of Object.entries(this._allSessions())) {
+                const savedAt = Number(session?.savedAt || 0);
                 if (now - savedAt < TaskPersistence.STALE_SESSION_GRACE_MS) continue;
                 if (this.sessionSavedAt && savedAt > this.sessionSavedAt) continue;
-                try { localStorage.removeItem(key); removed++; } catch {}
+                try { localStorage.removeItem(TaskPersistence.STORAGE_PREFIX + tabId); removed++; } catch {}
             }
             return removed;
+        }
+        // 显式取消只落在本标签页会话里，残留的死会话仍把这些 id 记成等待中；
+        // 不把 id 从它们身上抹掉，取消就会在每次刷新后一遍遍复活。_allSessions 已排除本页面与仍开着的页面。
+        pruneTasksFromStaleSessions(ids) {
+            const killed = new Set(Array.from(ids || []).map(String).filter(Boolean));
+            if (!killed.size) return 0;
+            let touched = 0;
+            for (const [tabId, session] of Object.entries(this._allSessions())) {
+                const tasks = Array.isArray(session?.tasks?.tasks) ? session.tasks.tasks : null;
+                if (!tasks) continue;
+                const kept = tasks.filter(task => !killed.has(String(task?.id || '')));
+                if (kept.length === tasks.length) continue;
+                session.tasks.tasks = kept;
+                if (Array.isArray(session.queue)) session.queue = session.queue.filter(id => !killed.has(String(id)));
+                try {
+                    localStorage.setItem(TaskPersistence.STORAGE_PREFIX + tabId, JSON.stringify(session));
+                    touched++;
+                } catch {}
+            }
+            return touched;
         }
         saveSession(reason = "update") {
             clearTimeout(this.saveTimer);
@@ -4076,6 +4152,10 @@ button:hover .dy-copy .front-copy,button:focus-visible .dy-copy .front-copy{anim
             try {
                 localStorage.setItem(this.storageKey, JSON.stringify(session));
                 this.sessionSavedAt = Number(session.savedAt) || this.sessionSavedAt;
+                if (this.cancelledIds.size) {
+                    this.pruneTasksFromStaleSessions(this.cancelledIds);
+                    this.cancelledIds.clear();
+                }
                 return session;
             } catch (error) {
                 console.warn("[dy-dl]任务状态保存失败", error);
@@ -4120,6 +4200,9 @@ button:hover .dy-copy .front-copy,button:focus-visible .dy-copy .front-copy{anim
             const session = picked.session;
             this.sessionSavedAt = Math.max(this.sessionSavedAt, Number(session.savedAt) || 0);
             this.store.restoreInto(session.tasks);
+            // 本次恢复里已经是“已取消”的任务，顺手从残留死会话里抹掉：
+            // 否则旧版本攒下的快照会在每次队列清空后被逐个接管，取消要重复好几遍才干净。
+            this.pruneTasksFromStaleSessions(this.store.list().filter(task => normalizeTaskState(task.state) === TaskState.CANCELLED).map(task => task.id));
             const decision = TabOwnershipPolicy.restoreDecision({
                 currentTabId: this.tabId,
                 sessionOwnerTabId: String(session.ownerTabId || picked.recoveredFromTabId || ""),
@@ -4147,12 +4230,6 @@ button:hover .dy-copy .front-copy,button:focus-visible .dy-copy .front-copy{anim
             const localUnresolved = localStats.active + localStats.queued + localStats.paused + localStats.needsAttention;
             if (localUnresolved > 0) return false;
             const sessions = this._allSessions();
-            delete sessions[this.tabId];
-            // 比本标签页最近一次落盘更旧的会话快照代表已被覆盖的历史状态；
-            // 若不拦下，取消掉等待项后正是 localUnresolved 归零，旧快照会把同一批作品重新变成等待中。
-            for (const tabId of Object.keys(sessions)) {
-                if (Number(sessions[tabId]?.savedAt || 0) <= this.sessionSavedAt) delete sessions[tabId];
-            }
             const lease = this.tabCoordinator?.readLease?.() || null;
             const picked = TabOwnershipPolicy.pickSession({ currentTabId: this.tabId, sessions, lease, now: Date.now() });
             if (!picked.session || picked.foreignAlive || !picked.recoveredFromTabId) return false;
@@ -4188,6 +4265,7 @@ button:hover .dy-copy .front-copy,button:focus-visible .dy-copy .front-copy{anim
             this.bound = true;
             this.offTaskChange = this.store.onChange(change => {
                 const state = normalizeTaskState(change?.task?.state || change?.task?.phase);
+                if (state === TaskState.CANCELLED && change?.changeMask?.has?.("state")) this.cancelledIds.add(String(change.taskId || ''));
                 const leaseRelevant = ACTIVE_TASK_STATES.has(state)
                     && (change?.changeMask?.has?.("loaded")
                         || change?.changeMask?.has?.("total")
@@ -4578,6 +4656,12 @@ button:hover .dy-copy .front-copy,button:focus-visible .dy-copy .front-copy{anim
                     state.directory = made.handle;
                     state.directoryName = made.name;
                 }
+                const authorName = String(media.authorInfo?.nickname || '').trim();
+                // 逐张保存也归到作者目录下：浏览器模式复用/新建该层目录，外部下载器靠 albumDirectory 传同一层路径。
+                if (!external && mode === 'files' && !state.directory && authorName && options.browserContext?.directoryHandle) {
+                    const made = await ReleaseFiles.useOrCreateDirectory(options.browserContext.directoryHandle, authorName);
+                    state.directory = made.handle;
+                }
                 if (!external && mode === 'zip') {
                     if (!state.target) {
                         state.target = options.browserContext?.directoryHandle
@@ -4588,11 +4672,9 @@ button:hover .dy-copy .front-copy,button:focus-visible .dy-copy .front-copy{anim
                 }
                 if (controller.signal.aborted)
                     throw new DOMException('已取消', 'AbortError');
-                for (let index = 0; index < media.images.length; index++) {
+                const runIndex = async index => {
                     if (controller.signal.aborted)
-                        throw new DOMException('已取消', 'AbortError');
-                    if (['completed', 'submitted'].includes(state.items.get(index)?.phase))
-                        continue;
+                        return { kind: 'throw', error: new DOMException('已取消', 'AbortError') };
                     const item = media.images[index];
                     if (mode === 'zip') {
                         try {
@@ -4600,11 +4682,11 @@ button:hover .dy-copy .front-copy,button:focus-visible .dy-copy .front-copy{anim
                         }
                         catch (error) {
                             if (controller.signal.aborted || error?.name === 'AbortError')
-                                throw error;
+                                return { kind: 'throw', error };
                             state.items.set(index, { index, phase: 'failed', message: error.message });
                             emit({ phase: 'failed', status: error.message });
                             // 保留已完成项；不生成缺图却被标记为完整的 ZIP。
-                            return finish({ ok: false, partial: state.items.size > 1, message: `第 ${index + 1} 项未完成：${error.message}`, reason: 'album_item_failed' });
+                            return { kind: 'finish', value: finish({ ok: false, partial: state.items.size > 1, message: `第 ${index + 1} 项未完成：${error.message}`, reason: 'album_item_failed' }) };
                         }
                     }
                     else {
@@ -4615,7 +4697,7 @@ button:hover .dy-copy .front-copy,button:focus-visible .dy-copy .front-copy{anim
                         const filename = `${base ? normalizeFilename(String(base), { maxLength: 200 }) : '图集'}_${seq}`;
                         const childOptions = { ...(previous?.context || {}), media, fileKind: kind, resourceKey: state.mediaId + '|' + kind + '|' + index,
                             browserContext: state.directory ? { kind: 'directory', directoryHandle: state.directory, batch: true, writeReady: true } : options.browserContext,
-                            albumDirectory: mode === 'folder' ? base : '', batch: true, silent: true, showGlobalProgress: false,
+                            albumDirectory: mode === 'folder' ? base : (external && mode === 'files' ? authorName : ''), batch: true, silent: true, showGlobalProgress: false,
                             onProgress: p => emit({ ...p, status: `${index + 1}/${state.total} · ${p.status || '正在下载'}` }),
                             refreshSources: async request => {
                                 const fresh = await options.refreshMedia?.(request);
@@ -4630,15 +4712,33 @@ button:hover .dy-copy .front-copy,button:focus-visible .dy-copy .front-copy{anim
                         activate();
                         if (result.paused) {
                             state.abortMode = 'pause';
-                            throw new DOMException('已暂停', 'AbortError');
+                            return { kind: 'throw', error: new DOMException('已暂停', 'AbortError') };
                         }
                         if (result.cancelled)
-                            throw new DOMException('已取消', 'AbortError');
+                            return { kind: 'throw', error: new DOMException('已取消', 'AbortError') };
                         if (!result.ok)
-                            return finish({ ...result, partial: index > 0, message: `第 ${index + 1} 项未完成：${result.message || result.reason || '下载失败'}` });
+                            return { kind: 'finish', value: finish({ ...result, partial: index > 0, message: `第 ${index + 1} 项未完成：${result.message || result.reason || '下载失败'}` }) };
                     }
                     emit({ phase: 'downloading' });
-                }
+                    return null;
+                };
+                // 通道数 1 时与旧的串行循环等价；并发只发生在同一个图集内部，跨作品仍按任务顺序。
+                // 逐张保存且没有目录句柄时每个子项都要单独弹保存框，框之间会抢用户手势，只能保持串行。
+                const pickerFree = external || mode === 'zip' || mode === 'folder' || !!options.browserContext?.directoryHandle;
+                // ZIP 拿不到 OPFS 暂存目录时，子项字节会全部堆在内存里，而 128MB 保护上限是按总量累计的，这里收紧通道。
+                const ceiling = mode === 'zip' && !state.tempDir ? 3 : 18;
+                const concurrency = pickerFree ? Math.min(Math.max(1, Number(features.album_concurrency) || 1), ceiling) : 1;
+                const pending = media.images.map((_item, index) => index).filter(index => !['completed', 'submitted'].includes(state.items.get(index)?.phase));
+                let cursor = 0, halt = null;
+                const lane = async () => {
+                    while (!halt && cursor < pending.length) {
+                        const outcome = await runIndex(pending[cursor++]);
+                        if (outcome) halt = outcome;
+                    }
+                };
+                await Promise.all(Array.from({ length: Math.min(concurrency, pending.length) }, lane));
+                if (halt?.kind === 'throw') throw halt.error;
+                if (halt) return halt.value;
                 if (mode === 'zip') {
                     emit({ phase: 'packing', status: '媒体已收齐，正在生成 ZIP' });
                     const complete = await this.pack(handler, media, state, controller.signal, emit);
@@ -4648,7 +4748,9 @@ button:hover .dy-copy .front-copy,button:focus-visible .dy-copy .front-copy{anim
                 if (state.includeText) {
                     const description = new Blob([this.description(media)], { type: 'text/plain;charset=utf-8' });
                     if (state.directory) {
-                        const t = await ReleaseFiles.reserve(state.directory, '作品说明.txt', state.mediaId + '|text');
+                        // 逐张保存的说明文件和同一作者的其他作品共用一层目录，得带上作品名才不会互相挤成 (1)(2)。
+                        const textName = mode === 'files' ? `${normalizeFilename(String(base || '作品'), { maxLength: 180 })} 说明.txt` : '作品说明.txt';
+                        const t = await ReleaseFiles.reserve(state.directory, textName, state.mediaId + '|text');
                         const w = await t.fileHandle.createWritable();
                         try {
                             await w.write(description);
@@ -13747,6 +13849,9 @@ h1{font-size:24px;letter-spacing:-.02em;font-weight:650}
 <option value="files">逐张保存</option>
 </select>
 </div>
+<label class="advanced-field">图集并发下载数<input aria-label="图集并发下载数" class="setting-input" data-setting="album_concurrency" max="18" min="1" step="1" type="number"/>
+</label>
+<p class="hint">同一个图集里同时传输的张数，1 为逐张依次下载；填到大于等于图集张数就是整组同时开始。不同作品之间仍按任务顺序执行。</p>
 <div class="setting-row">
 <div>
 <label for="setting-file_conflict">遇到同名文件</label>
@@ -14655,7 +14760,7 @@ h1{font-size:24px;letter-spacing:-.02em;font-weight:650}
                 button.disabled = Boolean(view.showAlbumMethods && external && button.dataset.method === 'zip');
                 button.title = button.disabled ? 'ZIP 需要在设置中选择浏览器保存' : '';
             });
-            this.q('#modeHint').textContent = !album ? '' : this.mode === 'zip' ? '每个作品一个 ZIP，按原图格式整理；不会额外降低画质。' : this.mode === 'folder' ? '每作品一个文件夹。保存到桌面时，请先新建并选择普通子文件夹，不要选择桌面本身。' : '每个子文件分别保存，名称保留作品编号和顺序。';
+            this.q('#modeHint').textContent = !album ? '' : this.mode === 'zip' ? '每个作品一个 ZIP，按原图格式整理；不会额外降低画质。' : this.mode === 'folder' ? '每作品一个文件夹。保存到桌面时，请先新建并选择普通子文件夹，不要选择桌面本身。' : '每个子文件分别保存，归到以作者昵称命名的父目录，名称保留作品名与顺序。';
             this.q('#fileName').textContent = this.filename();
             const textAvailable = album && Config.global.features.using_downloader === 'browser';
             this.q('#includeText').checked = textAvailable && this.includeText;
@@ -14663,7 +14768,12 @@ h1{font-size:24px;letter-spacing:-.02em;font-weight:650}
             this.q('#conflictHint').textContent = Config.global.features.file_conflict === 'ask' ? '保留作品编号 · 重名时先询问' : '保留作品编号 · 重名时保留两个文件';
             this.q('#resolution').value = Config.global.features.download_video_mode || 'default';
             this.q('#outputSummary').textContent = album ? `${media.images.length} 项媒体 · ${this.mode === 'zip' ? '整理为 1 个 ZIP' : this.mode === 'folder' ? '整理到 1 个作品文件夹' : '逐项保存'}` : '保存详情';
-            this.q('#outputTree').textContent = album ? this.filename() + (this.mode === 'zip' ? '（包内）' : '/') + '\n├─ 001.原始格式\n├─ 002.原始格式\n└─ …' + (this.includeText ? '\n└─ 作品说明.txt' : '') : this.filename();
+            const albumBase = this.mode === 'zip' ? this.filename().replace(/\.zip$/, '') : this.filename();
+            const albumAuthor = String(media?.authorInfo?.nickname || '').trim();
+            const albumContainer = this.mode === 'zip' ? `${albumBase}.zip（包内）` : this.mode === 'folder' ? `${albumBase}/` : albumAuthor ? `${albumAuthor}/` : '逐个选择保存位置';
+            this.q('#outputTree').textContent = album
+                ? `${albumContainer}\n├─ ${albumBase}_001.原始格式\n├─ ${albumBase}_002.原始格式\n└─ …` + (this.includeText ? `\n└─ ${this.mode === 'files' ? `${albumBase} 说明.txt` : '作品说明.txt'}` : '')
+                : this.filename();
             const resourceVisibility = [
                 [this.q('#audioAction'), view.showAudio],
                 [this.q('#coverAction'), view.showCover],
@@ -15985,6 +16095,9 @@ h1{font-size:24px;letter-spacing:-.02em;font-weight:650}
     let tabChannel = null;
     try { if (typeof globalThis.BroadcastChannel === "function") tabChannel = new globalThis.BroadcastChannel("douyin-dl-v210"); } catch {}
     const tabCoordinator = new TabOwnershipCoordinator({ tabId, storage: localStorage, channel: tabChannel });
+    tabCoordinator.startPresence();
+    window.addEventListener("pagehide", () => tabCoordinator.stopPresence(), { capture: true });
+    document.addEventListener("visibilitychange", () => { if (!document.hidden) tabCoordinator.touchPresence(); }, { passive: true });
     const mediaHandler = new MediaHandler(downloader, tabCoordinator);
     const taskPersistence = new TaskPersistence(UnifiedTasks, mediaHandler.scheduler, () => Config.global.features.using_downloader || "browser", tabCoordinator);
     const publishCurrentTabStatus = () => taskPersistence._publishTabStatus();
